@@ -1,0 +1,58 @@
+name: Ed Sheeran ticket price alert
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ed-sheeran-ticket-alert
+  cancel-in-progress: true
+
+jobs:
+  check-price:
+    runs-on: ubuntu-latest
+    env:
+      PRICE_THRESHOLD: "150"
+      GITHUB_OUTPUT_FILE: ticket-result.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check one-ticket all-in price
+        id: price
+        continue-on-error: true
+        run: python3 ticket_alert/check_ed_sheeran.py
+
+      - name: Show parsed result
+        if: always()
+        run: |
+          if test -f ticket-result.json; then
+            cat ticket-result.json
+          else
+            echo "No price result was produced. The site may be blocking automated checks."
+          fi
+
+      - name: Fail visibly only when price cannot be read
+        if: ${{ steps.price.outcome == 'failure' && hashFiles('ticket-result.json') == '' }}
+        run: exit 1
+
+      - name: Notify when price is at or below $150
+        if: ${{ steps.price.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRICE=$(python3 -c 'import json; print(json.load(open("ticket-result.json"))["lowest_all_in_price"])')
+          EXISTING=$(gh issue list --state open --label "ticket-alert" --search "Ed Sheeran $PRICE" --json number --jq 'length')
+          if test "$EXISTING" = "0"; then
+            gh label create ticket-alert --color D93F0B --description "Concert ticket price alert" 2>/dev/null || true
+            BODY="A StubHub price at or below \$150 including fees was detected for one ticket. Listings labeled obstructed, limited, restricted, partial, or side view were excluded where exposed. Check immediately: https://www.stubhub.com/ed-sheeran-santa-clara-tickets-7-25-2026/event/159434958 — Verify the exact section, view, quantity, and checkout total before purchasing."
+            gh issue create \
+              --assignee "rencon428-coder" \
+              --title "Ed Sheeran ticket found: \$$PRICE all-in" \
+              --label "ticket-alert" \
+              --body "$BODY"
+          fi

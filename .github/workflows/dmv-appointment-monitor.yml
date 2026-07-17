@@ -2,8 +2,7 @@ name: DMV appointment monitor
 
 on:
   schedule:
-    # GitHub's shortest supported interval is five minutes. Starting at minute
-    # 3 avoids the busiest queue time at the top of each hour.
+    # Check the public DMV Filter results every five minutes.
     - cron: "3/5 * * * *"
   workflow_dispatch:
 
@@ -21,26 +20,62 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check Bay Area drive-test dates
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           DEADLINE: "2026-07-31"
+          RESULTS_URL: "https://www.dmvfilter.com/?sort=appt%3Aasc&appt=DT&zip=95054&dist=30"
         with:
+          retries: 2
           script: |
-            const offices = {
-              "Santa Clara": "632!afa980930a4d9da9dea767520801e38ef924a286d22bf6d97782c5d20731",
-              "San Jose": "516!56b48e272ba45819d81868f440fb30eb6c406b705436cf1d101d2ea2c75c",
-              "Fremont": "644!03ada32357f5fd32a107fca81b020fd9b4fd0062cbaabf014dcacb6b5516",
-              "Los Gatos": "640!9ffc1fef9b57f8bf1ba6984ffdb4981acbf88d4b101ae27edac9d65a45f4",
-              "Redwood City": "548!c6a4228d96cbe545c591e4257d1c035da72cbe10671d502597460e5f0730",
-              "San Mateo": "593!fabfb52efab03764853fcdefa999d2a0be739510bec5207f4b82d5fb16e0"
-            };
-            const service = "DT!1857a62125c4425a24d85aceac6726cb8df3687d47b03b692e27bd8d17814";
-            const bookingUrl = "https://www.dmv.ca.gov/portal/appointments/select-appointment-type/";
             const deadline = process.env.DEADLINE;
+            const resultsUrl = process.env.RESULTS_URL;
+            const bookingUrl = "https://www.dmv.ca.gov/portal/appointments/select-appointment-type/";
             const today = new Date().toISOString().slice(0, 10);
 
             if (today > deadline) {
               core.info(`Deadline ${deadline} has passed; nothing to check.`);
+              return;
+            }
+
+            const response = await fetch(resultsUrl, {
+              headers: { "User-Agent": "ca-dmv-appointment-monitor/2.0" }
+            });
+            if (!response.ok) {
+              core.setFailed(`DMV Filter returned HTTP ${response.status}`);
+              return;
+            }
+            const html = await response.text();
+
+            // DMV Filter is a Next.js site. Decode its public page-data chunks,
+            // then read the drive-test date list for each filtered office.
+            let pageData = "";
+            for (const match of html.matchAll(/self\.__next_f\.push\((.*?)\)<\/script>/gs)) {
+              try {
+                const chunk = JSON.parse(match[1]);
+                if (typeof chunk[1] === "string") pageData += `${chunk[1]}\n`;
+              } catch (error) {
+                core.debug(`Skipped an unreadable page-data chunk: ${error.message}`);
+              }
+            }
+
+            const officePattern = /"id":\d+,"name":"([^"]+)"[\s\S]*?,"appts":\{"DL":\[[^\]]*\],"DT":\[([^\]]*)\]\}/g;
+            const candidates = [];
+            for (const match of pageData.matchAll(officePattern)) {
+              const office = match[1];
+              const dates = [...match[2].matchAll(/"(\d{4}-\d{2}-\d{2})"/g)]
+                .map(item => item[1])
+                .filter(value => value >= today && value <= deadline)
+                .sort();
+              core.info(`${office}: qualifying=${dates.length}`);
+              if (dates.length > 0) candidates.push({ office, dates });
+            }
+
+            if (pageData.length === 0 || !pageData.includes('"total":8')) {
+              core.setFailed("Could not parse the expected eight DMV Filter results.");
+              return;
+            }
+            if (candidates.length === 0) {
+              core.info(`No dates on or before ${deadline}.`);
               return;
             }
 
@@ -51,68 +86,33 @@ jobs:
               per_page: 100
             });
 
-            let successfulChecks = 0;
-            for (const [office, branchCode] of Object.entries(offices)) {
-              const url = new URL(
-                `https://www.dmv.ca.gov/portal/wp-json/dmv/v1/appointment/branches/${encodeURIComponent(branchCode)}/dates`
-              );
-              url.searchParams.append("services[]", service);
-              url.searchParams.set("numberOfCustomers", "1");
-
-              try {
-                const response = await fetch(url, {
-                  headers: { "User-Agent": "ca-dmv-appointment-monitor/1.0" }
-                });
-                if (!response.ok) {
-                  core.warning(`${office}: DMV returned HTTP ${response.status}`);
-                  continue;
-                }
-
-                const rawDates = await response.json();
-                if (!Array.isArray(rawDates)) {
-                  core.warning(`${office}: unexpected DMV response`);
-                  continue;
-                }
-                successfulChecks += 1;
-
-                const dates = [...new Set(rawDates.map(value => String(value).slice(0, 10)))].sort();
-                const matches = dates.filter(value => value >= today && value <= deadline);
-                core.info(`${office}: earliest=${dates[0] || "none"}; qualifying=${matches.length}`);
-                if (matches.length === 0) continue;
-
-                const title = `DMV opening: ${office} — ${matches[0]}`;
-                if (existing.some(issue => issue.title === title)) {
-                  core.info(`Already alerted: ${title}`);
-                  continue;
-                }
-
-                const dateList = matches.map(value => `- ${value}`).join("\n");
-                const body = [
-                  `A behind-the-wheel drive-test date on or before **${deadline}** was found.`,
-                  "",
-                  `**Office:** ${office}`,
-                  "",
-                  "**Available dates reported by the DMV API:**",
-                  dateList,
-                  "",
-                  `[Book on the official California DMV site](${bookingUrl})`,
-                  "",
-                  "Availability can disappear quickly, and the DMV may occasionally show a ghost appointment. This monitor does not book appointments."
-                ].join("\n");
-
-                await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title,
-                  body,
-                  assignees: [context.repo.owner]
-                });
-                core.notice(`Created alert: ${title}`);
-              } catch (error) {
-                core.warning(`${office}: check failed: ${error.message}`);
+            for (const { office, dates } of candidates) {
+              const title = `DMV opening: ${office} — ${dates[0]}`;
+              if (existing.some(issue => issue.title === title)) {
+                core.info(`Already alerted: ${title}`);
+                continue;
               }
-            }
 
-            if (successfulChecks === 0) {
-              core.setFailed("Every DMV office check failed.");
+              const body = [
+                `A behind-the-wheel drive-test date on or before **${deadline}** was found.`,
+                "",
+                `**Office:** ${office}`,
+                "",
+                "**Available dates reported by DMV Filter:**",
+                ...dates.map(value => `- ${value}`),
+                "",
+                `[Open the filtered results](${resultsUrl})`,
+                `[Book on the official California DMV site](${bookingUrl})`,
+                "",
+                "Availability can disappear quickly. This monitor only reports public DMV Filter results and does not book appointments."
+              ].join("\n");
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                assignees: [context.repo.owner]
+              });
+              core.notice(`Created alert: ${title}`);
             }

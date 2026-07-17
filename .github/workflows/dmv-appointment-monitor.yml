@@ -3,7 +3,7 @@ name: DMV appointment monitor
 on:
   schedule:
     # Check the public DMV Filter results every five minutes.
-    - cron: "3/5 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:

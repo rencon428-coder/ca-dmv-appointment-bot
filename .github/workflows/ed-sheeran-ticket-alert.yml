@@ -1,8 +1,6 @@
-name: Ed Sheeran ticket price alert
+name: Ed Sheeran ticket price alert (paused)
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
